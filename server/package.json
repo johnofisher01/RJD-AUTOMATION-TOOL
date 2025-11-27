@@ -1,0 +1,11 @@
+{
+  "dependencies": {
+    "docxtemplater": "^3.67.5",
+    "dotenv": "^17.2.3",
+    "fs-extra": "^11.3.2",
+    "googleapis": "^166.0.0",
+    "minimist": "^1.2.8",
+    "path": "^0.12.7",
+    "pizzip": "^3.2.0"
+  }
+}

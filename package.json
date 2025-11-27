@@ -1,0 +1,54 @@
+{
+  "name": "worksheet-automate",
+  "version": "1.0.0",
+  "main": "main.js",
+  "description": "A professional worksheet generator by RJ Dorey",
+  "author": "RJ Dorey",
+  "license": "MIT",
+  "scripts": {
+    "start": "electron .",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder --win --x64"
+  },
+  "devDependencies": {
+    "electron": "^39.2.3",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.rjdorey.worksheetgenerator",
+    "productName": "Worksheet Generator",
+    "directories": {
+      "buildResources": "assets",
+      "output": "dist"
+    },
+    "files": [
+      "main.js",
+      "server/**/*",
+      "client/build/**/*",
+      "server/electron-preload.js",
+      "package.json"
+    ],
+    "win": {
+      "target": [
+        "nsis",
+        "portable"
+      ],
+      "icon": "assets/icon.ico"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowElevation": true,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true
+    }
+  },
+  "dependencies": {
+    "docxtemplater": "^3.67.5",
+    "fs-extra": "^11.3.2",
+    "googleapis": "^166.0.0",
+    "minimist": "^1.2.8",
+    "pizzip": "^3.2.0",
+    "dotenv": "^16.3.1"
+  }
+}

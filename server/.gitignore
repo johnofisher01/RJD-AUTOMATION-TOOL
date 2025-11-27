@@ -1,0 +1,10 @@
+node_modules/
+client/node_modules
+client/build/
+dist/
+.env
+*.log
+.DS_Store
+-dist-out/
+-google-sheets-creds.json
+-server/google-sheets-creds.json
