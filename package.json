@@ -8,7 +8,7 @@
   "scripts": {
     "start": "electron .",
     "pack": "electron-builder --dir",
-    "dist": "electron-builder --win --x64"
+    "dist": "electron-builder --win --x64 --config.directories.output=dist-out"
   },
   "devDependencies": {
     "electron": "^39.2.3",
@@ -19,14 +19,20 @@
     "productName": "Worksheet Generator",
     "directories": {
       "buildResources": "assets",
-      "output": "dist"
+      "output": "dist-out"
     },
     "files": [
       "main.js",
       "server/**/*",
-      "client/build/**/*",
+      "client/build/**",
       "server/electron-preload.js",
-      "package.json"
+      "package.json",
+      "!**/.env",
+      "!google-sheets-creds.json"
+    ],
+    "extraResources": [
+      { "from": ".env", "to": ".env" },
+      { "from": "google-sheets-creds.json", "to": "google-sheets-creds.json" }
     ],
     "win": {
       "target": [
