@@ -2,13 +2,24 @@
 /**
  * server/poll-jotform.js
  *
- * JotForm poller that builds a row matching your spreadsheet header order:
- * [Timestamp, NAME, DATE, Job Number, Address, WORKS CARRIED OUT, HOURS,
- *  Work Still to do/Need to go back, WORKED WITH, Certificate Shared, MATERIALS,
- *  SUPPLIER, VARIATIONS - Extras (works outside scope of works / specification of job),
- *  HOURS EXTRA, EXTRA MATERIALS:, SUPPLIER EXTRAS]
+ * Simple JotForm poller for desktop/local use.
+ * - Polls the JotForm submissions API every POLL_INTERVAL_MS
+ * - Skips already processed submissions (saved to last_submission.txt)
+ * - Maps answers into a simple object and calls generate(mapped)
+ * - Tries to require ./fillTemplate.js and call a function export; if that fails,
+ *   falls back to spawning `node ./fillTemplate.js` and piping JSON to stdin.
  *
- * It converts non-string fields (dates/addresses) into sensible strings before appending.
+ * Config (put these in your project .env):
+ *   JOTFORM_API_KEY        - required
+ *   FORM_ID               - required (default 253362621119048)
+ *   JOTFORM_API_HOST      - optional (e.g. eu-api.jotform.com for EU Safe mode). Defaults to api.jotform.com
+ *   POLL_INTERVAL_MS      - optional (default 15000)
+ *   GOOGLE_SHEET_ID       - optional (if you want to append to Google Sheets)
+ *   GOOGLE_CREDENTIALS_PATH - optional (default google-sheets-creds.json)
+ *
+ * Usage:
+ *   npm install axios dotenv
+ *   node server/poll-jotform.js
  */
 require('dotenv').config();
 const axios = require('axios');
@@ -53,6 +64,7 @@ function mapSubmission(submission) {
       mapped[key] = ans.answer ?? ans.prettyFormat ?? ans.text ?? '';
     }
   } else if (submission) {
+    // fallback: copy top-level fields
     Object.assign(mapped, submission);
   }
   mapped._submission_id = submission.submission_id || submission.id;
@@ -60,52 +72,9 @@ function mapSubmission(submission) {
   return mapped;
 }
 
-// Convert various possible JotForm field shapes into a plain string for Sheets
-function fieldToString(v) {
-  if (v === null || v === undefined) return '';
-
-  if (typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean') {
-    return String(v);
-  }
-
-  if (typeof v === 'object') {
-    // Date object
-    if (v.datetime) return String(v.datetime);
-    if (v.year && v.month && v.day) {
-      const mm = String(v.month).padStart(2, '0');
-      const dd = String(v.day).padStart(2, '0');
-      return `${v.year}-${mm}-${dd}`;
-    }
-
-    // Address object
-    if (v.addr_line1 || v.addr_line2 || v.city || v.state || v.postal) {
-      const parts = [];
-      if (v.addr_line1) parts.push(v.addr_line1);
-      if (v.addr_line2) parts.push(v.addr_line2);
-      if (v.city) parts.push(v.city);
-      if (v.state) parts.push(v.state);
-      if (v.postal) parts.push(v.postal);
-      return parts.filter(Boolean).join(', ');
-    }
-
-    // Generic object: join values or fallback to JSON
-    try {
-      const vals = Object.values(v).filter(x => x !== undefined && x !== null).map(x => (typeof x === 'object' ? JSON.stringify(x) : String(x)));
-      if (vals.length) return vals.join(' | ');
-      return JSON.stringify(v);
-    } catch (e) {
-      return String(v);
-    }
-  }
-
-  return String(v);
-}
-
+// Optional helper: append to Google Sheets (best-effort)
 async function appendRowToSheet(rowValues) {
-  if (!GOOGLE_SHEET_ID) {
-    console.warn('GOOGLE_SHEET_ID not set; skipping sheet append');
-    return;
-  }
+  if (!GOOGLE_SHEET_ID) return;
   try {
     const sheetsHelper = require('./append-to-sheets');
     await sheetsHelper.appendRow(GOOGLE_SHEET_ID, rowValues, GOOGLE_CREDENTIALS_PATH);
@@ -115,7 +84,12 @@ async function appendRowToSheet(rowValues) {
 }
 
 /**
- * generate(mapped) - require() or spawn fallback for server/fillTemplate.js
+ * Robust generate(mapped):
+ * 1) If server/fillTemplate.js exists:
+ *    - try to require() it and call a function export (common names).
+ *    - if no callable export found or require() throws, fallback to spawning
+ *      `node server/fillTemplate.js` and piping JSON to stdin.
+ * 2) If no file, return false.
  */
 async function generate(mapped) {
   const modulePath = path.join(__dirname, 'fillTemplate.js');
@@ -124,13 +98,17 @@ async function generate(mapped) {
     return false;
   }
 
+  // Try require() first
   try {
+    // clear cache to allow quick changes during development
     try { delete require.cache[require.resolve(modulePath)]; } catch (_) {}
     const mod = require(modulePath);
 
+    // Build candidate functions to call
     const candidates = [];
     if (typeof mod === 'function') candidates.push(mod);
     if (mod && typeof mod.default === 'function') candidates.push(mod.default);
+
     ['generate','fillTemplate','fill','create','run','main','process','createDocument'].forEach(name => {
       if (mod && typeof mod[name] === 'function') candidates.push(mod[name]);
     });
@@ -143,6 +121,7 @@ async function generate(mapped) {
         return true;
       } catch (err) {
         console.warn('Calling exported generator function failed:', err && err.message ? err.message : err);
+        // fall through to spawn fallback
       }
     } else {
       console.warn('fillTemplate.js found but no callable export detected. Will try spawning it as a CLI.');
@@ -151,6 +130,7 @@ async function generate(mapped) {
     console.warn('Error requiring fillTemplate.js (will try spawn fallback):', err && err.message ? err.message : err);
   }
 
+  // Spawn fallback: run node fillTemplate.js and pipe mapped JSON to stdin
   try {
     return await new Promise((resolve) => {
       const cp = child_process.spawn(process.execPath, [modulePath], { stdio: ['pipe','inherit','inherit'] });
@@ -175,7 +155,7 @@ async function processNew() {
     const submissions = await listSubmissions();
     if (!submissions || !submissions.length) return;
 
-    // newest-first -> process oldest-first
+    // submissions are newest-first; process oldest-first so ordering is sensible
     submissions.reverse();
 
     const last = readLastProcessed();
@@ -184,11 +164,12 @@ async function processNew() {
     for (const s of submissions) {
       const sid = s.submission_id || s.id;
       if (!sid) continue;
+      // if we've already seen this (or it's older), skip
       if (last && sid <= last) continue;
 
       const mapped = mapSubmission(s);
 
-      // DEBUG: show mapped object to verify keys
+      // DEBUG: print the mapped submission so you can confirm exact JotForm field keys
       console.log('Mapped submission:', JSON.stringify(mapped, null, 2));
 
       console.log('Processing submission', sid);
@@ -196,60 +177,38 @@ async function processNew() {
         const ok = await generate(mapped);
         if (ok) {
           newestSeen = sid;
-
-          // Build row in exact header order
-          const timestamp = fieldToString(mapped._created_at || mapped.Timestamp || mapped.timestamp || new Date().toISOString());
-          const name = fieldToString(mapped.name || mapped.NAME || mapped.Name || mapped['Full Name'] || mapped['Full name'] || mapped.your_name || '');
-          const dateField = fieldToString(mapped.date || mapped.meeting_date || mapped.DATE || mapped._created_at || mapped.datetime || '');
-          const jobNumber = fieldToString(mapped.jobNumber || mapped['Job Number'] || mapped['JOB NUMBER'] || mapped.jobNumber || mapped.jobNumber || mapped['jobNumber'] || '');
-          const addressStr = fieldToString(mapped.address || mapped.Address || mapped.addr || mapped['Address'] || '');
-          const worksCarried = fieldToString(mapped.worksCarried || mapped['WORKS CARRIED OUT'] || mapped['Works carried out'] || mapped.worksCarried || mapped.worksCarried || '');
-          const hours = fieldToString(mapped.hours || mapped.HOURS || mapped['HOURS'] || mapped.hours || '');
-          const workStill = fieldToString(
-            mapped['Work Still to do/Need to go back'] ||
-            mapped['work still to do/need to go back'] ||
-            mapped.workStill ||
-            mapped['WORK STILL TO DO/NEED TO GO BACK'] ||
-            mapped.work_still_to_do ||
-            mapped.WORK_STILL_TO_DO ||
-            mapped['Work Still to do'] ||
-            ''
-          );
-          const workedWith = fieldToString(mapped.workedWith || mapped['WORKED WITH'] || mapped['Worked With'] || mapped.workedWith || '');
-          const certificateShared = fieldToString(mapped.certificateShared || mapped['Certificate Shared'] || mapped.CERTIFICATE_SHARED || '');
-          const materials = fieldToString(mapped.materials || mapped.MATERIALS || mapped['MATERIALS'] || '');
-          const supplier = fieldToString(mapped.supplier || mapped.SUPPLIER || mapped.supplierFor || mapped['SUPPLIER EXTRAS'] || '');
-          const variations = fieldToString(mapped.variations || mapped.extras || mapped['VARIATIONS - Extras (works outside scope of works / specification of job)'] || mapped.VARIATIONS || '');
-          const hoursExtra = fieldToString(mapped.hoursExtra || mapped['HOURS EXTRA'] || mapped.HOURS_EXTRA || mapped.hoursExtra || '');
-          const extraMaterials = fieldToString(mapped.extraMatierials || mapped['EXTRA MATERIALS:'] || mapped.extraMaterials || mapped.EXTRA_MATERIALS || '');
-          const supplierExtras = fieldToString(mapped.supplierFor || mapped['SUPPLIER EXTRAS'] || mapped.supplierExtras || '');
-
+          // best-effort: append a row to Google Sheets (if configured)
           const row = [
-            timestamp,
-            name,
-            dateField,
-            jobNumber,
-            addressStr,
-            worksCarried,
-            hours,
-            workStill,
-            workedWith,
-            certificateShared,
-            materials,
-            supplier,
-            variations,
-            hoursExtra,
-            extraMaterials,
-            supplierExtras
-          ];
+            // Name column
+            mapped.name || mapped.Name || mapped['Full Name'] || mapped['Full name'] || mapped['your_name'] || '',
 
-          console.log('Appending row to sheet:', JSON.stringify(row));
-          await appendRowToSheet(row);
+            // Email column
+            mapped.email || mapped.Email || mapped['E-mail'] || mapped['your_email'] || '',
+
+            // Meeting / Date column
+            mapped.meeting_date || mapped.date || mapped['Date'] || mapped._created_at || '',
+
+            // Work Still to do / Need to go back (explicit header and fallbacks)
+            mapped['Work Still to do/Need to go back'] ||
+              mapped['work still to do/need to go back'] ||
+              mapped['WORK STILL TO DO/NEED TO GO BACK'] ||
+              mapped['Work Still to do'] ||
+              mapped['works still to do'] ||
+              mapped.WORK_STILL_TO_DO ||
+              mapped.work_still_to_do ||
+              mapped['WORK STILL TO DO'] ||
+              '',
+
+            // Timestamp column added by poller
+            new Date().toISOString()
+          ];
+          appendRowToSheet(row);
         } else {
           console.warn('Generator returned false/failed for', sid);
         }
       } catch (err) {
         console.error('Generator failed for', sid, err && err.message ? err.message : err);
+        // do not update last processed so it can be retried later
       }
     }
 
@@ -262,7 +221,7 @@ async function processNew() {
 
 async function run() {
   console.log('Starting JotForm poller for form', FORM_ID, 'using host', API_HOST, 'poll interval', POLL_INTERVAL_MS, 'ms');
-  await processNew();
+  await processNew(); // initial run
   setInterval(processNew, POLL_INTERVAL_MS);
 }
 
