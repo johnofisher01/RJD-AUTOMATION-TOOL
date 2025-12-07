@@ -170,17 +170,7 @@ function App() {
           {loading ? "Generating..." : "Generate Worksheets"}
         </button>
 
-        <div className="folder-btn-under">
-          <button
-            className="folder-btn"
-            title="Go to Worksheets Folder"
-            onClick={handleFolderClick}
-            disabled={!outputFolder}
-          >
-            <span className="btn-icon" role="img" aria-label="worksheets">📁</span>
-            <span className="folder-label">Worksheets</span>
-          </button>
-        </div>
+    
 
         {(error || output) && (
           <div className={`result-box${error ? " error" : ""}`}>

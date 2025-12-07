@@ -13,7 +13,7 @@ const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const CREDS_PATH = process.env.GOOGLE_CREDENTIALS_PATH || path.join(__dirname, 'google-sheets-creds.json');
 const TEMPLATE_PATH = path.join(__dirname, 'templates', 'worksheet_template_10.docx');
 const OUTPUT_DIR = argv.output ? path.resolve(argv.output) : path.join(__dirname, 'output');
-// Use env var if set; fallback keeps backwards compatibility
+// configurable sheet/tab name (exact match required)
 const SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Form Responses 1';
 
 function safeFilename(str) {
@@ -32,7 +32,6 @@ async function getRows() {
     });
     const sheets = google.sheets({ version: 'v4', auth });
 
-    // Log which sheet/range is being used (helps debug)
     console.log(`Using spreadsheetId=${SHEET_ID} range="${SHEET_RANGE}"`);
 
     const response = await sheets.spreadsheets.values.get({
@@ -43,32 +42,73 @@ async function getRows() {
     const values = response.data.values || [];
     const [header, ...rows] = values;
     if (!header) return [];
-    return rows.map(row =>
+
+    console.log('Header row detected:', header);
+
+    const mappedRows = rows.map(row =>
         header.reduce((obj, key, i) => {
             obj[key] = row[i] || '';
             return obj;
         }, {})
     );
+
+    if (mappedRows.length) {
+        console.log('Sample mapped row (first):', mappedRows[0]);
+        console.log('Mapped to template fields (sample):', mapSheetRowToTemplateFields(mappedRows[0]));
+    }
+
+    return mappedRows;
 }
 
+/**
+ * mapSheetRowToTemplateFields(row)
+ * - Accepts a row object where keys are the exact header strings from the sheet.
+ * - Normalizes header keys and provides many fallbacks matching the sheet headers you pasted.
+ * - Combines multi-column address into a single ADDRESS field.
+ */
 function mapSheetRowToTemplateFields(row) {
-    return {
-        NAME: row['NAME'] || '',
-        DATE: row['DATE'] || '',
-        JOB_NO: row['Job Number'] || row['JOB NUMBER'] || '',
-        CUSTOMER: row['Customer'] || '',
-        ADDRESS: row['Address'] || '',
-        WORKS_CARRIED_OUT: row['WORKS CARRIED OUT'] || '',
-        HOURS: row['HOURS'] || '',
-        WORK_STILL_TO_DO: row['WORK STILL TO DO/NEED TO GO BACK'] || '',
-        WORKED_WITH: row['WORKED WITH'] || '',
-        CERTIFICATE_SHARED: row['Certificate Shared'] || '',
-        MATERIALS: row['MATERIALS'] || '',
-        EXTRAS: row['VARIATIONS - Extras (works outside scope of works / specification of job)'] || '',
-        HOURS_EXTRA: row['HOURS EXTRA'] || '',
-        EXTRA_MATERIALS: row['EXTRA MATERIALS:'] || '',
-        SUPPLIER: (row['SUPPLIER'] || row['SUPPLIER EXTRAS']) || '',
-    };
+  const normalize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
+  const normRow = {};
+  for (const k of Object.keys(row || {})) normRow[normalize(k)] = row[k];
+
+  const pick = (...names) => {
+    for (const n of names) {
+      const v = normRow[normalize(n)];
+      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
+    }
+    return '';
+  };
+
+  // Build address from parts present in your sheet headers
+  const addrParts = [
+    pick('Address - Street Address', 'Address - Street Address', 'street address', 'address'),
+    pick('Address - Street Address Line 2', 'Address - Street Address Line 2', 'street address line 2', 'address line 2'),
+    pick('Address - City', 'Address - City', 'city'),
+    pick('Address - State / Province', 'Address - State / Province', 'state', 'province'),
+    pick('Address - Postal / Zip Code', 'Address - Postal / Zip Code', 'postal', 'zip', 'postcode')
+  ].filter(Boolean);
+  const ADDRESS = addrParts.join(', ');
+
+  return {
+    NAME: pick('Name', 'Full Name', 'full name', 'name'),
+    DATE: pick('Date', 'DATE', '_created_at', 'date'),
+    JOB_NO: pick('Job Number', 'JOB NUMBER', 'Job No', 'job number', 'job_no'),
+    CUSTOMER: pick('Customer', 'CLIENT', 'client'),
+    ADDRESS,
+    WORKS_CARRIED_OUT: pick('Works carried out', 'WORKS CARRIED OUT', 'works carried out', 'works'),
+    HOURS: pick('Hours', 'HOURS', 'hour'),
+    WORK_STILL_TO_DO: pick('Work Still to do/Need to go back', 'WORK STILL TO DO/NEED TO GO BACK', 'Work Still to do', 'works still to do', 'to go back'),
+    WORKED_WITH: pick('Worked with', 'WORKED WITH', 'worked with'),
+    CERTIFICATE_SHARED: pick('Certificate Shared', 'CERTIFICATE_SHARED', 'certificate shared'),
+    MATERIALS: pick('Materials', 'MATERIALS'),
+    // Extras column in your sheet:
+    EXTRAS: pick('VARIATIONS - Extras (works outside scope of works / specification of job)', 'VARIATIONS - Extras', 'Extras', 'EXTRAS', 'variations', 'works outside scope'),
+    HOURS_EXTRA: pick('Hours Extra', 'HOURS EXTRA', 'Hours Extra', 'hours extra', 'Hours Extra'),
+    // Note typo in sheet header: "Extra Matierials"
+    EXTRA_MATERIALS: pick('Extra Matierials', 'Extra Materials', 'EXTRA MATERIALS', 'Extra Materials', 'Extra Matierials'),
+    // Suppliers - prefer main Supplier, fall back to Supplier for Extras
+    SUPPLIER: pick('Supplier', 'SUPPLIER', 'Supplier for Extras', 'Supplier for extras', 'supplier for extras')
+  };
 }
 
 function createDocx(data) {
