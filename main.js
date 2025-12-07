@@ -4,6 +4,25 @@ const fs = require('fs');
 const { spawn } = require('child_process');
 const dotenv = require('dotenv');
 
+// --- Prevent multiple instances (single-instance lock) ---
+const gotLock = app.requestSingleInstanceLock();
+if (!gotLock) {
+  console.log('Another instance is already running — exiting this one.');
+  app.quit();
+} else {
+  app.on('second-instance', (event, argv, workingDirectory) => {
+    // Someone tried to open a second instance — focus the existing window instead of spawning another
+    if (global.mainWindow) {
+      try {
+        if (global.mainWindow.isMinimized()) global.mainWindow.restore();
+        global.mainWindow.focus();
+      } catch (e) {
+        console.warn('Failed to focus mainWindow on second-instance:', e && e.message);
+      }
+    }
+  });
+}
+
 // --- Load .env safely: prefer a resources .env when packaged, otherwise use project .env ---
 function loadDotenv() {
   try {
@@ -53,6 +72,9 @@ app.setPath('userData', userDataPath);
 app.commandLine.appendSwitch('disk-cache-dir', path.join(userDataPath, 'Cache'));
 // ------------------------------------------------------------------------------
 
+// track poller pid for cleanup
+let pollerPid = null;
+
 function createWindow() {
   const win = new BrowserWindow({
     width: 800,
@@ -64,11 +86,46 @@ function createWindow() {
     }
   });
 
+  // expose main window globally so the single-instance handler can focus it
+  global.mainWindow = win;
+
   const startUrl = process.env.ELECTRON_START_URL || `file://${path.join(__dirname, 'client', 'build', 'index.html')}`;
   win.loadURL(startUrl);
 }
 
-app.whenReady().then(createWindow);
+// attempt to require a local poller-spawner so we can start the poller on ready
+try {
+  const spawnerPath = path.join(__dirname, 'server', 'poller-spawner');
+  if (fs.existsSync(path.join(__dirname, 'server', 'poller-spawner.js'))) {
+    global.__spawnPoller = require(spawnerPath).spawnPoller;
+  } else {
+    console.warn('poller-spawner.js not found in server/ — poller will not auto-start.');
+  }
+} catch (e) {
+  console.warn('poller-spawner not available:', e && e.message);
+}
+
+app.whenReady().then(() => {
+  createWindow();
+
+  // start poller if available
+  try {
+    const spawnPoller = global.__spawnPoller;
+    if (typeof spawnPoller === 'function') {
+      const pid = spawnPoller({
+        sheetId: process.env.GOOGLE_SHEET_ID,
+        sheetTab: process.env.SHEET_TAB,
+        keepAttached: false
+      });
+      pollerPid = pid;
+      console.log('[main] poller spawn pid=', pid);
+    } else {
+      console.log('[main] spawnPoller not a function; skipping poller start');
+    }
+  } catch (e) {
+    console.warn('Failed to start poller:', e && e.message);
+  }
+});
 
 ipcMain.handle('chooseOutputFolder', async () => {
   const result = await dialog.showOpenDialog({ properties: ['openDirectory'] });
@@ -83,6 +140,8 @@ ipcMain.handle('generateWorksheets', async (event, outputFolder) => {
     if (process.resourcesPath && !fs.existsSync(scriptPath)) {
       const unpacked = path.join(process.resourcesPath, 'app.asar.unpacked', 'server', 'fillFromSheet.js');
       if (fs.existsSync(unpacked)) scriptPath = unpacked;
+      const resourcesServer = path.join(process.resourcesPath, 'server', 'fillFromSheet.js');
+      if (fs.existsSync(resourcesServer)) scriptPath = resourcesServer;
     }
 
     if (!fs.existsSync(scriptPath)) {
@@ -138,6 +197,18 @@ ipcMain.handle('generateWorksheets', async (event, outputFolder) => {
       resolve(`Error: ${err.message}`);
     });
   });
+});
+
+// ensure background poller is killed on quit (best-effort)
+app.on('before-quit', () => {
+  try {
+    if (pollerPid) {
+      console.log('[poller] killing pid', pollerPid);
+      process.kill(pollerPid);
+    }
+  } catch (e) {
+    console.warn('Failed to kill poller:', e && e.message);
+  }
 });
 
 app.on('window-all-closed', () => {

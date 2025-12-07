@@ -7,3 +7,4 @@ client/build/
 dist-out/
 google-sheets-creds.json
 server/google-sheets-creds.json
+.env.bak
