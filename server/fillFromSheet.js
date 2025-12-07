@@ -13,7 +13,8 @@ const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const CREDS_PATH = process.env.GOOGLE_CREDENTIALS_PATH || path.join(__dirname, 'google-sheets-creds.json');
 const TEMPLATE_PATH = path.join(__dirname, 'templates', 'worksheet_template_10.docx');
 const OUTPUT_DIR = argv.output ? path.resolve(argv.output) : path.join(__dirname, 'output');
-const SHEET_RANGE = 'Form Responses 1';
+// Use env var if set; fallback keeps backwards compatibility
+const SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Form Responses 1';
 
 function safeFilename(str) {
     return String(str || '').replace(/[\/\\?%*:|"<>]/g, '-');
@@ -30,11 +31,18 @@ async function getRows() {
         scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
     const sheets = google.sheets({ version: 'v4', auth });
+
+    // Log which sheet/range is being used (helps debug)
+    console.log(`Using spreadsheetId=${SHEET_ID} range="${SHEET_RANGE}"`);
+
     const response = await sheets.spreadsheets.values.get({
         spreadsheetId: SHEET_ID,
         range: SHEET_RANGE,
     });
-    const [header, ...rows] = response.data.values;
+
+    const values = response.data.values || [];
+    const [header, ...rows] = values;
+    if (!header) return [];
     return rows.map(row =>
         header.reduce((obj, key, i) => {
             obj[key] = row[i] || '';
@@ -95,7 +103,7 @@ function createDocx(data) {
         }
         console.log(`\nSuccess! Total worksheets generated: ${generatedCount}`);
     } catch (err) {
-        console.error('\nFailed:', err.message);
+        console.error('\nFailed:', err && err.message ? err.message : err);
         process.exit(1);
     }
 })();

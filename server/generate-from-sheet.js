@@ -13,7 +13,8 @@ const SHEET_ID = process.env.GOOGLE_SHEET_ID;
 const CREDS_PATH = process.env.GOOGLE_CREDENTIALS_PATH || path.join(__dirname, 'google-sheets-creds.json');
 const TEMPLATE_PATH = path.join(__dirname, 'templates', 'worksheet_template_10.docx');
 const OUTPUT_DIR = argv.output ? path.resolve(argv.output) : path.join(__dirname, 'output');
-const SHEET_RANGE = 'Form Responses 1';
+// Use env var if set; fallback keeps backwards compatibility
+const SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Form Responses 1';
 
 function safeFilename(str) {
     return String(str || '').replace(/[\/\\?%*:|"<>]/g, '-');
@@ -30,10 +31,15 @@ async function getRows() {
         scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
     });
     const sheets = google.sheets({ version: 'v4', auth });
+
+    // Log which sheet/range is being used (helps debug)
+    console.log(`Using spreadsheetId=${SHEET_ID} range="${SHEET_RANGE}"`);
+
     const response = await sheets.spreadsheets.values.get({
         spreadsheetId: SHEET_ID,
         range: SHEET_RANGE,
     });
+
     const [header, ...rows] = response.data.values || [];
     if (!header) return [];
     return rows.map(row =>
@@ -49,7 +55,6 @@ async function getRows() {
  * Ensures your column "Work Still to do/Need to go back" (and variants) are matched.
  */
 function mapSheetRowToTemplateFields(row) {
-  // normalize keys so 'Works still to do', 'WORKS STILL TO DO', 'WORK STILL TO DO/NEED TO GO BACK', etc. all match
   const normalize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const normRow = {};
   for (const k of Object.keys(row || {})) normRow[normalize(k)] = row[k];
@@ -70,7 +75,6 @@ function mapSheetRowToTemplateFields(row) {
     ADDRESS: pick('Address', 'ADDRESS', 'address'),
     WORKS_CARRIED_OUT: pick('WORKS CARRIED OUT', 'Works carried out', 'works carried out', 'WORKS_CARRIED_OUT'),
     HOURS: pick('HOURS', 'Hours', 'hours'),
-    // This picks your column "Work Still to do/Need to go back" and many common variants
     WORK_STILL_TO_DO: pick(
       'Work Still to do/Need to go back',
       'WORK STILL TO DO/NEED TO GO BACK',
