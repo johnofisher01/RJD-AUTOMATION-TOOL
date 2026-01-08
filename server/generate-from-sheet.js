@@ -68,10 +68,14 @@ async function getRows() {
   return mappedRows;
 }
 
+/**
+ * Safe parseDateCandidates (same logic as fillfromsheet)
+ */
 function parseDateCandidates(s) {
   const out = { date: null, candidates: [], chosenKind: null };
   if (!s) return out;
   const str = String(s).trim();
+
   const native = new Date(str);
   if (!Number.isNaN(native.getTime())) out.candidates.push({ kind: 'native', date: native });
 
@@ -79,18 +83,35 @@ function parseDateCandidates(s) {
   if (parts) {
     const p1 = Number(parts[1]), p2 = Number(parts[2]), p3 = Number(parts[3]);
     const year = p3 < 100 ? (2000 + p3) : p3;
-    const dmy = new Date(year, p2 - 1, p1);
-    if (!Number.isNaN(dmy.getTime())) out.candidates.push({ kind: 'dmy', date: dmy });
-    const mdy = new Date(year, p1 - 1, p2);
-    if (!Number.isNaN(mdy.getTime())) out.candidates.push({ kind: 'mdy', date: mdy });
+
+    if (p2 >= 1 && p2 <= 12 && p1 >= 1 && p1 <= 31) {
+      const dmy = new Date(year, p2 - 1, p1);
+      if (dmy.getFullYear() === year && dmy.getMonth() === p2 - 1 && dmy.getDate() === p1) {
+        out.candidates.push({ kind: 'dmy', date: dmy });
+      }
+    }
+
+    if (p1 >= 1 && p1 <= 12 && p2 >= 1 && p2 <= 31) {
+      const mdy = new Date(year, p1 - 1, p2);
+      if (mdy.getFullYear() === year && mdy.getMonth() === p1 - 1 && mdy.getDate() === p2) {
+        out.candidates.push({ kind: 'mdy', date: mdy });
+      }
+    }
   }
 
   if (out.candidates.length) {
-    const nativeC = out.candidates.find(c => c.kind === 'native');
-    const chosen = nativeC ? nativeC : out.candidates[0];
-    out.date = chosen.date;
-    out.chosenKind = chosen.kind;
+    const dmyC = out.candidates.find(c => c.kind === 'dmy');
+    if (dmyC) {
+      out.date = dmyC.date;
+      out.chosenKind = 'dmy';
+    } else {
+      const nativeC = out.candidates.find(c => c.kind === 'native');
+      const chosen = nativeC ? nativeC : out.candidates[0];
+      out.date = chosen.date;
+      out.chosenKind = chosen.kind;
+    }
   }
+
   return out;
 }
 
@@ -264,7 +285,7 @@ function pruneOutputDir(keepN) {
       console.log(`Processing selected rows (${rows.length}).`);
     }
 
-    // Optional job filter
+    // Optionally filter by job number
     let filtered = rows;
     if (JOB_FILTER) {
       filtered = rows.filter(r => {

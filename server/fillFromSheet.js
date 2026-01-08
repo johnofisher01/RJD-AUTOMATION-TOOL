@@ -70,35 +70,57 @@ async function getRows() {
 }
 
 /**
- * parseDateCandidates
+ * Safe parseDateCandidates
  * - returns { date: Date|null, candidates: [{kind,date}], chosenKind }
- * - tries native Date parse and dd/mm/yyyy & mm/dd/yyyy when numeric pattern exists.
+ * - validates numeric parts so JS Date overflow cannot produce misleading dates
  */
 function parseDateCandidates(s) {
   const out = { date: null, candidates: [], chosenKind: null };
   if (!s) return out;
   const str = String(s).trim();
 
+  // Native parse (may be ambiguous)
   const native = new Date(str);
   if (!Number.isNaN(native.getTime())) out.candidates.push({ kind: 'native', date: native });
 
+  // Numeric pattern e.g. 12/15/2025 or 08-12-2025
   const parts = str.match(/^(\d{1,2})[\/\-\.\s](\d{1,2})[\/\-\.\s](\d{2,4})$/);
   if (parts) {
     const p1 = Number(parts[1]), p2 = Number(parts[2]), p3 = Number(parts[3]);
     const year = p3 < 100 ? (2000 + p3) : p3;
-    const dmy = new Date(year, p2 - 1, p1);
-    if (!Number.isNaN(dmy.getTime())) out.candidates.push({ kind: 'dmy', date: dmy });
-    const mdy = new Date(year, p1 - 1, p2);
-    if (!Number.isNaN(mdy.getTime())) out.candidates.push({ kind: 'mdy', date: mdy });
+
+    // DMY candidate (day = p1, month = p2) — only if month/day valid and construction matches inputs
+    if (p2 >= 1 && p2 <= 12 && p1 >= 1 && p1 <= 31) {
+      const dmy = new Date(year, p2 - 1, p1);
+      if (dmy.getFullYear() === year && dmy.getMonth() === p2 - 1 && dmy.getDate() === p1) {
+        out.candidates.push({ kind: 'dmy', date: dmy });
+      }
+    }
+
+    // MDY candidate (month = p1, day = p2) — only if month/day valid and construction matches inputs
+    if (p1 >= 1 && p1 <= 12 && p2 >= 1 && p2 <= 31) {
+      const mdy = new Date(year, p1 - 1, p2);
+      if (mdy.getFullYear() === year && mdy.getMonth() === p1 - 1 && mdy.getDate() === p2) {
+        out.candidates.push({ kind: 'mdy', date: mdy });
+      }
+    }
   }
 
+  // Choose preferred candidate:
+  // prefer DMY if available (common UK), else prefer native if present, else first candidate
   if (out.candidates.length) {
-    // choose native if available, else first candidate
-    const nativeC = out.candidates.find(c => c.kind === 'native');
-    const chosen = nativeC ? nativeC : out.candidates[0];
-    out.date = chosen.date;
-    out.chosenKind = chosen.kind;
+    const dmyC = out.candidates.find(c => c.kind === 'dmy');
+    if (dmyC) {
+      out.date = dmyC.date;
+      out.chosenKind = 'dmy';
+    } else {
+      const nativeC = out.candidates.find(c => c.kind === 'native');
+      const chosen = nativeC ? nativeC : out.candidates[0];
+      out.date = chosen.date;
+      out.chosenKind = chosen.kind;
+    }
   }
+
   return out;
 }
 
@@ -138,7 +160,7 @@ function mapSheetRowToTemplateFields(row) {
 
   const ADDRESS = addrParts.join(', ');
 
-  // Column indexes (0-based): O=14, S=18
+  // Column indexes (0-based): O = 14, S = 18
   const supplierFromO = pickByIndex(14);
   const supplierFromS = pickByIndex(18);
 
@@ -223,7 +245,7 @@ function pruneOutputDir(keepN) {
 
     console.log(`Total rows read from sheet: ${rows.length}`);
 
-    // Days filter (default 7): keep only rows whose mapped DATE is within the last DAYS
+    // Days filter (default 7)
     if (DAYS > 0) {
       const now = Date.now();
       const cutoff = now - (DAYS * 24 * 60 * 60 * 1000);
@@ -238,7 +260,6 @@ function pruneOutputDir(keepN) {
         let chosenDate = parsed.date;
         let chosenKind = parsed.chosenKind;
 
-        // If both dmy and mdy exist, prefer the one within range if exactly one is within range
         const candDMY = parsed.candidates.find(c => c.kind === 'dmy');
         const candMDY = parsed.candidates.find(c => c.kind === 'mdy');
         if (candDMY && candMDY) {
@@ -270,7 +291,7 @@ function pruneOutputDir(keepN) {
       console.log(`After --days ${DAYS} filter: ${rows.length} rows (from ${preFilterCount})`);
     }
 
-    // LAST_N slicing (after days filter)
+    // LAST_N slicing
     if (LAST_N > 0) {
       rows = rows.slice(-LAST_N);
       console.log(`Processing last ${LAST_N} rows (of selected ${rows.length + Math.max(0, (rows.length - LAST_N))}).`);
