@@ -1,3 +1,5 @@
+// Final authoritative generator — deterministic British D-M-YYYY filenames only.
+// Includes lock-file protection to avoid concurrent runs.
 const fs = require('fs-extra');
 const path = require('path');
 const { google } = require('googleapis');
@@ -5,7 +7,6 @@ const PizZip = require('pizzip');
 const Docxtemplater = require('docxtemplater');
 const minimist = require('minimist');
 
-// Load .env from project root (one level above server/)
 require('dotenv').config({ path: path.join(__dirname, '..', '.env') });
 
 const argv = minimist(process.argv.slice(2));
@@ -15,17 +16,29 @@ const TEMPLATE_PATH = path.join(__dirname, 'templates', 'worksheet_template_10.d
 const OUTPUT_DIR = argv.output ? path.resolve(argv.output) : path.join(__dirname, 'output');
 const SHEET_RANGE = process.env.GOOGLE_SHEET_RANGE || 'Form Responses 1';
 
-// CLI flags and defaults
 const LAST_N = Number(argv.last || argv.lastN || argv.max || 0);
 const PRUNE_N = Number(argv.prune || 0);
 const FORCE = !!argv.force;
 const DRY = !!argv.dry || !!argv['dry-run'];
 const DEBUG = !!argv.debug;
-// Default to 7 days if not provided
 const DAYS = Number(argv.days || argv['since-days'] || process.env.DEFAULT_DAYS || 7);
 
+// Lock-file to prevent concurrent runs
+const LOCK_PATH = path.join(__dirname, '.generator.lock');
+if (fs.existsSync(LOCK_PATH)) {
+  console.error('Another generator run appears active (lock present). Exiting.');
+  process.exit(1);
+}
+try { fs.writeFileSync(LOCK_PATH, String(process.pid)); } catch (e) {}
+function removeLock() { try { if (fs.existsSync(LOCK_PATH)) fs.unlinkSync(LOCK_PATH); } catch (e) {} }
+process.on('exit', removeLock);
+process.on('SIGINT', () => process.exit(1));
+process.on('SIGTERM', () => process.exit(1));
+
+const FINAL_DATE_REGEX = /^\d{1,2}-\d{1,2}-\d{4}$/;
+
 function safeFilename(str) {
-  return String(str || '').replace(/[\/\\?%*:|"<>]/g, '-');
+  return String(str || '').replace(/[\/\\?%*:|"<>]/g, '-').trim();
 }
 
 async function getRows() {
@@ -51,9 +64,6 @@ async function getRows() {
   const [header, ...rows] = values;
   if (!header) return [];
 
-  console.log('Header row detected:', header);
-
-  // produce array of objects and attach raw __row array for index-based picks
   const mappedRows = rows.map(row =>
     header.reduce((obj, key, i) => {
       obj[key] = row[i] || '';
@@ -70,58 +80,76 @@ async function getRows() {
 }
 
 /**
- * Safe parseDateCandidates
- * - returns { date: Date|null, candidates: [{kind,date}], chosenKind }
- * - validates numeric parts so JS Date overflow cannot produce misleading dates
+ * Deterministic parser — numeric strings ARE ALWAYS day-first (DMY).
+ * Recognises numeric DMY, ISO, and common textual month formats.
  */
-function parseDateCandidates(s) {
-  const out = { date: null, candidates: [], chosenKind: null };
-  if (!s) return out;
+function parseDateDeterministic(s) {
+  if (!s) return { date: null, kind: null };
   const str = String(s).trim();
 
-  // Native parse (may be ambiguous)
-  const native = new Date(str);
-  if (!Number.isNaN(native.getTime())) out.candidates.push({ kind: 'native', date: native });
-
-  // Numeric pattern e.g. 12/15/2025 or 08-12-2025
-  const parts = str.match(/^(\d{1,2})[\/\-\.\s](\d{1,2})[\/\-\.\s](\d{2,4})$/);
-  if (parts) {
-    const p1 = Number(parts[1]), p2 = Number(parts[2]), p3 = Number(parts[3]);
-    const year = p3 < 100 ? (2000 + p3) : p3;
-
-    // DMY candidate (day = p1, month = p2) — only if month/day valid and construction matches inputs
-    if (p2 >= 1 && p2 <= 12 && p1 >= 1 && p1 <= 31) {
-      const dmy = new Date(year, p2 - 1, p1);
-      if (dmy.getFullYear() === year && dmy.getMonth() === p2 - 1 && dmy.getDate() === p1) {
-        out.candidates.push({ kind: 'dmy', date: dmy });
-      }
+  // 1) numeric DMY (allow leading zeros)
+  let m = str.match(/^0*(\d{1,2})[\/\-\.\s]0*(\d{1,2})[\/\-\.\s](\d{2,4})$/);
+  if (m) {
+    const day = Number(m[1]), month = Number(m[2]), rawYear = Number(m[3]);
+    const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const d = new Date(year, month - 1, day);
+      if (d.getFullYear() === year && d.getMonth() === month - 1 && d.getDate() === day) return { date: d, kind: 'dmy' };
     }
+    return { date: null, kind: null };
+  }
 
-    // MDY candidate (month = p1, day = p2) — only if month/day valid and construction matches inputs
-    if (p1 >= 1 && p1 <= 12 && p2 >= 1 && p2 <= 31) {
-      const mdy = new Date(year, p1 - 1, p2);
-      if (mdy.getFullYear() === year && mdy.getMonth() === p1 - 1 && mdy.getDate() === p2) {
-        out.candidates.push({ kind: 'mdy', date: mdy });
-      }
+  // 2) ISO yyyy-mm-dd
+  m = str.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if (m) {
+    const year = Number(m[1]), month = Number(m[2]), day = Number(m[3]);
+    const d = new Date(year, month - 1, day);
+    if (d.getFullYear() === year && d.getMonth() === month - 1 && d.getDate() === day) return { date: d, kind: 'iso' };
+    return { date: null, kind: null };
+  }
+
+  // 3) textual months e.g. "5 Jan 2026", "January 5 2026", "5th January 2026"
+  const monthNames = {
+    january:1, february:2, march:3, april:4, may:5, june:6,
+    july:7, august:8, september:9, october:10, november:11, december:12,
+    jan:1, feb:2, mar:3, apr:4, may:5, jun:6, jul:7, aug:8, sep:9, sept:9, oct:10, nov:11, dec:12
+  };
+  const cleaned = str.replace(/,/g,' ').replace(/\s+/g,' ').trim();
+  m = cleaned.match(/^(\d{1,2})(?:st|nd|rd|th)?\s+([A-Za-z]{3,9})\s+(\d{4})$/i);
+  if (m) {
+    const day = Number(m[1]), month = monthNames[m[2].toLowerCase()], year = Number(m[3]);
+    if (month && day >=1 && day <=31) {
+      const d = new Date(year, month -1, day);
+      if (d.getFullYear() === year && d.getMonth() === month -1 && d.getDate() === day) return { date: d, kind: 'text' };
+    }
+  }
+  m = cleaned.match(/^([A-Za-z]{3,9})\s+(\d{1,2})(?:st|nd|rd|th)?\s+(\d{4})$/i);
+  if (m) {
+    const month = monthNames[m[1].toLowerCase()], day = Number(m[2]), year = Number(m[3]);
+    if (month && day >=1 && day <=31) {
+      const d = new Date(year, month -1, day);
+      if (d.getFullYear() === year && d.getMonth() === month -1 && d.getDate() === day) return { date: d, kind: 'text' };
     }
   }
 
-  // Choose preferred candidate:
-  // prefer DMY if available (common UK), else prefer native if present, else first candidate
-  if (out.candidates.length) {
-    const dmyC = out.candidates.find(c => c.kind === 'dmy');
-    if (dmyC) {
-      out.date = dmyC.date;
-      out.chosenKind = 'dmy';
-    } else {
-      const nativeC = out.candidates.find(c => c.kind === 'native');
-      const chosen = nativeC ? nativeC : out.candidates[0];
-      out.date = chosen.date;
-      out.chosenKind = chosen.kind;
-    }
-  }
+  return { date: null, kind: null };
+}
 
-  return out;
+function formatDateForFilename(date) {
+  if (!date || !(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+  return `${String(date.getDate())}-${String(date.getMonth() + 1)}-${String(date.getFullYear())}`;
+}
+
+function normalizeRawDateForFilename(raw) {
+  if (!raw) return null;
+  const s = String(raw).trim();
+  const parts = s.match(/^0*(\d{1,2})[\/\-\.\s]0*(\d{1,2})[\/\-\.\s](\d{2,4})$/);
+  if (!parts) return null;
+  let day = Number(parts[1]), month = Number(parts[2]), rawYear = Number(parts[3]);
+  const year = rawYear < 100 ? 2000 + rawYear : rawYear;
+  const d = new Date(year, month - 1, day);
+  if (d.getFullYear() === year && d.getMonth() === month - 1 && d.getDate() === day) return `${day}-${month}-${year}`;
+  return null;
 }
 
 /**
@@ -130,25 +158,10 @@ function parseDateCandidates(s) {
 function mapSheetRowToTemplateFields(row) {
   const normalize = (s) => String(s || '').toLowerCase().replace(/[^a-z0-9]/g, '');
   const normRow = {};
-  for (const k of Object.keys(row || {})) {
-    if (k === '__row') continue;
-    normRow[normalize(k)] = row[k];
-  }
+  for (const k of Object.keys(row || {})) { if (k === '__row') continue; normRow[normalize(k)] = row[k]; }
 
-  const pick = (...names) => {
-    for (const name of names) {
-      const v = normRow[normalize(name)];
-      if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim();
-    }
-    return '';
-  };
-
-  const pickByIndex = (idx) => {
-    const arr = row && row.__row ? row.__row : [];
-    if (!Array.isArray(arr)) return '';
-    const v = arr[idx];
-    return (v !== undefined && v !== null && String(v).trim() !== '') ? String(v).trim() : '';
-  };
+  const pick = (...names) => { for (const name of names) { const v = normRow[normalize(name)]; if (v !== undefined && v !== null && String(v).trim() !== '') return String(v).trim(); } return ''; };
+  const pickByIndex = (idx) => { const arr = row && row.__row ? row.__row : []; if (!Array.isArray(arr)) return ''; const v = arr[idx]; return (v !== undefined && v !== null && String(v).trim() !== '') ? String(v).trim() : ''; };
 
   const addrParts = [
     pick('Address - Street Address', 'Address - Street Address', 'street address', 'address'),
@@ -157,30 +170,27 @@ function mapSheetRowToTemplateFields(row) {
     pick('Address - State / Province', 'Address - State / Province', 'state', 'province'),
     pick('Address - Postal / Zip Code', 'Address - Postal / Zip Code', 'postal', 'zip', 'postcode')
   ].filter(Boolean);
-
   const ADDRESS = addrParts.join(', ');
-
-  // Column indexes (0-based): O = 14, S = 18
   const supplierFromO = pickByIndex(14);
   const supplierFromS = pickByIndex(18);
 
   return {
-    NAME: pick('Name', 'Full Name', 'full name', 'name'),
-    DATE: pick('Date', 'DATE', '_created_at', 'date'),
-    JOB_NO: pick('Job Number', 'JOB NUMBER', 'Job No', 'job number', 'job_no'),
-    CUSTOMER: pick('Customer', 'Customer Name', 'CLIENT', 'client'),
+    NAME: pick('Name','Full Name','full name','name'),
+    DATE: pick('Date','DATE','_created_at','date'),
+    JOB_NO: pick('Job Number','JOB NUMBER','Job No','job number','job_no'),
+    CUSTOMER: pick('Customer','Customer Name','CLIENT','client'),
     ADDRESS,
-    WORKS_CARRIED_OUT: pick('Works carried out', 'WORKS CARRIED OUT', 'works carried out', 'works'),
-    HOURS: pick('Hours', 'HOURS', 'hour'),
-    WORK_STILL_TO_DO: pick('Work Still to do/Need to go back', 'WORK STILL TO DO/NEED TO GO BACK', 'Work Still to do', 'works still to do', 'to go back'),
-    WORKED_WITH: pick('Worked with', 'WORKED WITH', 'worked with'),
-    CERTIFICATE_SHARED: pick('Certificate Shared', 'CERTIFICATE_SHARED', 'certificate shared'),
-    MATERIALS: pick('Materials', 'MATERIALS'),
-    SUPPLIER_O: supplierFromO || pick('First Supplier', 'Supplier O', 'Supplier (1)', 'supplier1', 'supplier'),
-    EXTRAS: pick('VARIATIONS - Extras (works outside scope of works / specification of job)', 'VARIATIONS - Extras', 'Extras', 'EXTRAS', 'variations', 'works outside scope'),
-    HOURS_EXTRA: pick('Hours Extra', 'HOURS EXTRA', 'Hours Extra', 'hours extra'),
-    EXTRA_MATERIALS: pick('Extra Matierials', 'Extra Materials', 'EXTRA MATERIALS', 'Extra Materials', 'Extra Matierials'),
-    SUPPLIER: supplierFromS || pick('Supplier', 'SUPPLIER', 'Supplier for Extras', 'Supplier for extras', 'supplier for extras')
+    WORKS_CARRIED_OUT: pick('Works carried out','WORKS CARRIED OUT','works carried out','works'),
+    HOURS: pick('Hours','HOURS','hour'),
+    WORK_STILL_TO_DO: pick('Work Still to do/Need to go back','WORK STILL TO DO/NEED TO GO BACK','Work Still to do','works still to do','to go back'),
+    WORKED_WITH: pick('Worked with','WORKED WITH','worked with'),
+    CERTIFICATE_SHARED: pick('Certificate Shared','CERTIFICATE_SHARED','certificate shared'),
+    MATERIALS: pick('Materials','MATERIALS'),
+    SUPPLIER_O: supplierFromO || pick('First Supplier','Supplier O','Supplier (1)','supplier1','supplier'),
+    EXTRAS: pick('VARIATIONS - Extras (works outside scope of works / specification of job)','VARIATIONS - Extras','Extras','EXTRAS','variations','works outside scope'),
+    HOURS_EXTRA: pick('Hours Extra','HOURS EXTRA','Hours Extra','hours extra'),
+    EXTRA_MATERIALS: pick('Extra Matierials','Extra Materials','EXTRA MATERIALS','Extra Materials','Extra Matierials'),
+    SUPPLIER: supplierFromS || pick('Supplier','SUPPLIER','Supplier for Extras','Supplier for extras','supplier for extras')
   };
 }
 
@@ -191,11 +201,32 @@ function createDocx(data) {
   const zip = new PizZip(content);
   const doc = new Docxtemplater(zip, { paragraphLoop: true, linebreaks: true });
   doc.render(data);
-  const safeDate = safeFilename(data.DATE || 'nodate');
+
+  const rawDateStr = data.DATE || '';
+  const parsed = parseDateDeterministic(rawDateStr);
+  const parsedDate = parsed.date;
+  const parsedKind = parsed.kind;
+
+  let formattedDate = null;
+  if (parsedDate) formattedDate = formatDateForFilename(parsedDate);
+  if (!formattedDate) {
+    const normalized = normalizeRawDateForFilename(rawDateStr);
+    if (normalized) formattedDate = normalized;
+  }
+  const safeDate = formattedDate || 'nodate';
+
+  if (safeDate !== 'nodate' && !FINAL_DATE_REGEX.test(safeDate)) {
+    console.error('FATAL: computed filename date does not match D-M-YYYY:', safeDate);
+    console.error(`[filename-debug] raw="${rawDateStr}" kind="${parsedKind}" parsed="${parsedDate ? parsedDate.toISOString() : ''}" formatted="${formattedDate || ''}"`);
+    throw new Error('Invalid filename date format - aborting');
+  }
+
   const safeName = safeFilename(data.NAME || 'NONAME');
   const safeJobNumber = safeFilename(data.JOB_NO || 'NOJOBNO');
   const outputFile = path.join(OUTPUT_DIR, `${safeDate}-${safeName}-${safeJobNumber}.docx`);
   const buf = doc.getZip().generate({ type: 'nodebuffer' });
+
+  console.log(`[filename-debug] raw="${rawDateStr}" kind="${parsedKind || ''}" parsed="${parsedDate ? parsedDate.toISOString() : ''}" formatted="${formattedDate || ''}" final="${safeDate}" output="${outputFile}"`);
 
   if (fs.existsSync(outputFile) && !FORCE) {
     console.log('Skipping existing file:', outputFile);
@@ -211,112 +242,48 @@ function createDocx(data) {
   return { skipped: false, path: outputFile };
 }
 
-function pruneOutputDir(keepN) {
-  if (!keepN || keepN <= 0) return;
-  if (!fs.existsSync(OUTPUT_DIR)) return;
-  const files = fs.readdirSync(OUTPUT_DIR)
-    .map(name => ({ name, full: path.join(OUTPUT_DIR, name) }))
-    .filter(f => f.name.toLowerCase().endsWith('.docx'))
-    .map(f => ({ ...f, mtime: fs.statSync(f.full).mtimeMs }))
-    .sort((a, b) => b.mtime - a.mtime);
-  if (files.length <= keepN) return;
-  const toDelete = files.slice(keepN);
-  for (const f of toDelete) {
-    try {
-      if (DRY) {
-        console.log('[dry-run] would prune old file:', f.full);
-      } else {
-        fs.unlinkSync(f.full);
-        console.log('Pruned old file:', f.full);
-      }
-    } catch (err) {
-      console.warn('Failed to delete', f.full, err.message || err);
-    }
-  }
-}
-
 (async () => {
   try {
     let rows = await getRows();
-    if (!rows.length) {
-      console.log('No rows in sheet!');
-      return;
-    }
-
+    if (!rows.length) { console.log('No rows in sheet!'); return; }
     console.log(`Total rows read from sheet: ${rows.length}`);
 
-    // Days filter (default 7)
     if (DAYS > 0) {
       const now = Date.now();
       const cutoff = now - (DAYS * 24 * 60 * 60 * 1000);
-      const preFilterCount = rows.length;
       const kept = [];
-
       for (const r of rows) {
         const mapped = mapSheetRowToTemplateFields(r);
         const dateStr = mapped.DATE || r['Date'] || r['_created_at'] || '';
-        const parsed = parseDateCandidates(dateStr);
-
-        let chosenDate = parsed.date;
-        let chosenKind = parsed.chosenKind;
-
-        const candDMY = parsed.candidates.find(c => c.kind === 'dmy');
-        const candMDY = parsed.candidates.find(c => c.kind === 'mdy');
-        if (candDMY && candMDY) {
-          const dmyOk = candDMY.date.getTime() >= cutoff;
-          const mdyOk = candMDY.date.getTime() >= cutoff;
-          if (dmyOk && !mdyOk) {
-            chosenDate = candDMY.date;
-            chosenKind = 'dmy';
-          } else if (mdyOk && !dmyOk) {
-            chosenDate = candMDY.date;
-            chosenKind = 'mdy';
-          }
-        }
-
+        const parsed = parseDateDeterministic(dateStr);
+        const chosenDate = parsed.date;
         const keep = chosenDate && chosenDate.getTime() >= cutoff;
-
         if (DEBUG) {
           console.log('--- row debug ---');
           console.log('raw DATE field:', dateStr);
-          console.log('candidates:', parsed.candidates.map(t => ({ kind: t.kind, iso: t.date.toISOString() })));
-          console.log('chosen kind:', chosenKind, chosenDate ? chosenDate.toISOString() : null);
+          console.log('parsed kind/date:', parsed.kind, parsed.date ? parsed.date.toISOString() : '');
           console.log('kept (within last', DAYS, 'days)?', keep);
         }
-
         if (keep) kept.push(r);
       }
-
       rows = kept;
-      console.log(`After --days ${DAYS} filter: ${rows.length} rows (from ${preFilterCount})`);
+      console.log(`After --days ${DAYS} filter: ${rows.length} rows`);
     }
 
-    // LAST_N slicing
-    if (LAST_N > 0) {
-      rows = rows.slice(-LAST_N);
-      console.log(`Processing last ${LAST_N} rows (of selected ${rows.length + Math.max(0, (rows.length - LAST_N))}).`);
-    } else {
-      console.log(`Processing selected rows (${rows.length}).`);
-    }
+    if (LAST_N > 0) rows = rows.slice(-LAST_N);
 
     let generatedCount = 0;
     for (const [i, row] of rows.entries()) {
       const tplData = mapSheetRowToTemplateFields(row);
       const out = createDocx(tplData);
-      if (out && !out.skipped) {
-        console.log('Generated for row', i + 1, ':', out.path);
-        generatedCount++;
-      }
+      if (out && !out.skipped) generatedCount++;
     }
 
     console.log(`\nSuccess! Total worksheets generated: ${generatedCount}`);
-
-    if (PRUNE_N > 0) {
-      console.log(`Pruning output directory to keep only ${PRUNE_N} newest .docx files.`);
-      pruneOutputDir(PRUNE_N);
-    }
   } catch (err) {
     console.error('\nFailed:', err && err.message ? err.message : err);
     process.exit(1);
+  } finally {
+    removeLock();
   }
 })();
